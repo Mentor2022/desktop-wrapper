@@ -1,1 +1,146 @@
+name: Build Windows app
 
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Build id (12 hex characters)
+        required: true
+      app_name:
+        required: true
+      app_url:
+        description: Website address (https)
+        required: true
+      app_id:
+        description: App id, like com.wrapped.a1b2c3d4
+        required: true
+      icon_url:
+        description: Signed link to the app icon (optional)
+        required: false
+        default: ''
+      color:
+        description: Main colour, like #00897B
+        required: false
+        default: '#00897B'
+      version:
+        description: Version, like 1.0.3
+        required: false
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    # Values are passed through env, never pasted into commands
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      APP_URL: ${{ inputs.app_url }}
+      APP_ID: ${{ inputs.app_id }}
+      ICON_URL: ${{ inputs.icon_url }}
+      COLOR: ${{ inputs.color }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check inputs
+        run: |
+          node - <<'JS'
+          const fs = require('fs'), path = require('path');
+          const e = process.env;
+          const bad = (m) => { console.log('ERROR: ' + m); process.exit(1); };
+          if (!/^[0-9a-f]{12}$/.test(e.BUILD_ID)) bad('bad build id');
+          if (!/^com\.wrapped\.[a-z0-9]{1,20}$/.test(e.APP_ID)) bad('bad app id');
+          if (!/^[\p{L}\p{N} .,\-]{2,30}$/u.test(e.APP_NAME)) bad('bad app name');
+          if (!/^https:\/\/[A-Za-z0-9.-]+(\/[A-Za-z0-9._~\/%?=&#:+-]*)?$/.test(e.APP_URL)) bad('bad website address (it must start with https://)');
+          if (e.ICON_URL && !/^https:\/\/\S+$/.test(e.ICON_URL)) bad('bad icon url');
+          if (!/^#[0-9A-Fa-f]{6}$/.test(e.COLOR)) bad('bad colour');
+          if (!/^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,6}$/.test(e.VERSION)) bad('bad version');
+          const cfg = { url: e.APP_URL, name: e.APP_NAME, appId: e.APP_ID, color: e.COLOR };
+          fs.writeFileSync(path.join(e.RUNNER_TEMP, 'config.json'), JSON.stringify(cfg));
+          console.log(JSON.stringify(cfg));
+          JS
+
+      - uses: actions/checkout@v4
+
+      - name: Find the project
+        shell: pwsh
+        run: |
+          # Either the project sits in the repo, or it comes as ONE zip file in the repo
+          $zips = @(Get-ChildItem -Path . -Filter *.zip -File)
+          if ($zips.Count -gt 1) { Write-Host "ERROR: found $($zips.Count) zip files. Keep exactly one zip in the repo."; exit 1 }
+          if ($zips.Count -eq 1) {
+            Expand-Archive -Path $zips[0].FullName -DestinationPath extracted -Force
+            $main = Get-ChildItem extracted -Recurse -Filter main.js | Where-Object { Test-Path (Join-Path $_.DirectoryName 'package.json') } | Sort-Object { $_.FullName.Length } | Select-Object -First 1
+          } else {
+            $main = Get-Item -Path ./main.js -ErrorAction SilentlyContinue
+          }
+          if (-not $main) { Write-Host "ERROR: main.js not found. Is the project in the repo?"; exit 1 }
+          $p = $main.DirectoryName -replace '\\', '/'
+          "PROJECT=$p" >> $env:GITHUB_ENV
+          Write-Host "Project folder: $p"
+
+      - name: Apply settings and icon
+        shell: pwsh
+        run: |
+          Copy-Item "$env:RUNNER_TEMP/config.json" "$env:PROJECT/config.json" -Force
+          New-Item -ItemType Directory -Force -Path "$env:PROJECT/build" | Out-Null
+          if ($env:ICON_URL) {
+            Invoke-WebRequest -Uri $env:ICON_URL -OutFile icon.src -TimeoutSec 60
+            if ((Get-Item icon.src).Length -gt 3000000) { Write-Host "ERROR: icon is too big"; exit 1 }
+            Add-Type -AssemblyName System.Drawing
+            $src = [System.Drawing.Image]::FromFile((Resolve-Path icon.src).Path)
+            $bmp = New-Object System.Drawing.Bitmap 512, 512
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.InterpolationMode = 'HighQualityBicubic'
+            $g.SmoothingMode = 'HighQuality'
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $scale = [Math]::Min(512 / $src.Width, 512 / $src.Height)
+            $w = [int]($src.Width * $scale); $h = [int]($src.Height * $scale)
+            $g.DrawImage($src, [int]((512 - $w) / 2), [int]((512 - $h) / 2), $w, $h)
+            $bmp.Save("$env:PROJECT/build/icon.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose(); $src.Dispose()
+            Write-Host "Icon replaced"
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build the installer
+        working-directory: ${{ env.PROJECT }}
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          # Optional: if you added a Windows code-signing certificate as secrets, the installer is signed (no SmartScreen warning)
+          if [ -n "$WIN_CSC_LINK" ]; then export CSC_LINK="$WIN_CSC_LINK" CSC_KEY_PASSWORD="$WIN_CSC_KEY_PASSWORD"; fi
+          npm pkg set version="$VERSION"
+          npm install --no-audit --no-fund 2>&1 | tee "$RUNNER_TEMP/build.log"
+          npm run dist 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          echo "===== BUILD ERRORS (copy from here) ====="
+          grep -n -i -E "error|failed|cannot|not found|ENOENT|EPERM" -A3 "$RUNNER_TEMP/build.log" | head -90 || true
+
+      - name: Name the file
+        run: |
+          F="$PROJECT/dist/$BUILD_ID-setup.exe"
+          [ -f "$F" ] || { echo "ERROR: the installer was not created"; ls -la "$PROJECT/dist" || true; exit 1; }
+          SIZE=$(wc -c < "$F")
+          [ "$SIZE" -gt 20000000 ] || { echo "ERROR: the installer is too small ($SIZE bytes)"; exit 1; }
+          cp "$F" "./$BUILD_ID-setup.exe"
+          echo "Installer: $SIZE bytes"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-${{ inputs.build_id }}
+          name: Windows ${{ inputs.app_name }} ${{ inputs.version }}
+          make_latest: false
+          files: ${{ inputs.build_id }}-setup.exe
