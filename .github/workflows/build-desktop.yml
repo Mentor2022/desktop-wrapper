@@ -1,5 +1,6 @@
 name: Build Windows app
 
+
 on:
   workflow_dispatch:
     inputs:
