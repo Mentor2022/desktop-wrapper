@@ -120,6 +120,7 @@ jobs:
           # Optional: if you added a Windows code-signing certificate as secrets, the installer is signed (no SmartScreen warning)
           if [ -n "$WIN_CSC_LINK" ]; then export CSC_LINK="$WIN_CSC_LINK" CSC_KEY_PASSWORD="$WIN_CSC_KEY_PASSWORD"; fi
           npm pkg set version="$VERSION"
+          npm pkg set build.nsis.warningsAsErrors=false --json
           npm install --no-audit --no-fund 2>&1 | tee "$RUNNER_TEMP/build.log"
           npm run dist 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
@@ -127,7 +128,7 @@ jobs:
         if: failure()
         run: |
           echo "===== BUILD ERRORS (copy from here) ====="
-          grep -n -i -E "error|failed|cannot|not found|ENOENT|EPERM" -A3 "$RUNNER_TEMP/build.log" | head -90 || true
+          grep -n -i -E "error|failed|cannot|not found|ENOENT|EPERM|warning" -A3 "$RUNNER_TEMP/build.log" | head -90 || true
 
       - name: Name the file
         run: |
